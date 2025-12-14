@@ -33,9 +33,9 @@ dependencies = [
     "av",
     "aiortc",
     "uvicorn[standard]",
-    "fastapi",
-    "flash-attn>=2.0.0;sys_platform == 'linux'"
+    "fastapi"
 ]
+
 
 [project.urls]
 "Homepage" = "https://github.com/microsoft/VibeVoice"
@@ -43,19 +43,3 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchaudio = [
-    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchvision = [
-    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
