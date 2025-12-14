@@ -820,6 +820,124 @@ class TokenizerDecoder(nn.Module):
         x = self.forward_features(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         x = self.head(x, cache=cache, sample_indices=sample_indices, use_cache=use_cache, debug=debug)
         return x
+
+
+class TokenizerEncoder(nn.Module):
+    """
+    Encoder component for the VibeVoice tokenizer that converts audio to latent representations.
+    """
+    def __init__(self, config):
+        super().__init__()
+        
+        self.dimension = config.vae_dim
+        self.channels = config.channels
+        self.n_filters = config.encoder_n_filters
+        self.n_filters = config.encoder_n_filters
+        self.ratios = list(reversed(config.encoder_ratios))
+        self.depths = [int(d) for d in config.encoder_depths.split('-')] if isinstance(config.encoder_depths, str) else config.encoder_depths
+        
+        self.n_residual_layers = getattr(config, "n_residual_layers", 1)
+        self.causal = config.causal
+        
+        kernel_size = getattr(config, "kernel_size", 7)
+        norm = getattr(config, "norm", "none")
+        norm_params = getattr(config, "norm_params", {})
+        pad_mode = getattr(config, "pad_mode", "reflect")
+        bias = getattr(config, "bias", True)
+        layernorm = getattr(config, "layernorm", "LN")
+        layernorm_eps = getattr(config, "layernorm_eps", 1e-6)
+        layernorm_elementwise_affine = getattr(config, "layernorm_elementwise_affine", True)
+        drop_path_rate = getattr(config, "drop_path_rate", 0.0)
+        mixer_layer = getattr(config, "mixer_layer", "conv")
+        layer_scale_init_value = getattr(config, "layer_scale_init_value", 0)
+        disable_last_norm = getattr(config, "disable_last_norm", False)
+
+        if layernorm == 'LN':
+            norm_type = ConvLayerNorm
+        elif layernorm == 'RMSNorm':
+            norm_type = partial(ConvRMSNorm, elementwise_affine=layernorm_elementwise_affine)
+        else:
+            raise ValueError(f"Unsupported norm type: {layernorm}")
+            
+        # Configure layers
+        self.downsample_layers = nn.ModuleList()
+        self.stages = nn.ModuleList()
+        
+        # 1. Stem (Audio -> Filters)
+        stem = nn.Sequential(
+            SConv1d(self.channels, self.n_filters, kernel_size, stride=1, 
+                    norm=norm, norm_kwargs=norm_params, causal=self.causal, pad_mode=pad_mode, bias=bias)
+        )
+        self.downsample_layers.append(stem)
+        
+        # Stage 0
+        layer_type = partial(
+            Block1D,
+            mixer_layer=mixer_layer,
+            layernorm=layernorm,
+            eps=layernorm_eps,
+            causal=self.causal,
+            pad_mode=pad_mode,
+            norm=norm,
+            bias=bias,
+            layer_scale_init_value=layer_scale_init_value,
+        )
+        
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(self.depths))]
+        current_depth_idx = 0
+        
+        stage0 = nn.Sequential(
+             *[layer_type(dim=self.n_filters, drop_path=dp_rates[current_depth_idx + j]) for j in range(self.depths[0])]
+        )
+        self.stages.append(stage0)
+        current_depth_idx += self.depths[0]
+        
+        current_channels = self.n_filters
+        
+        # 2. Downsampling Layers and Stages
+        for i in range(len(self.ratios)):
+            stride = self.ratios[i]
+            in_ch = current_channels
+            out_ch = current_channels * 2 
+            # Note: channel scaling logic should match Decoder's reverse
+            
+            down = nn.Sequential(
+                SConv1d(in_ch, out_ch, kernel_size=stride*2, stride=stride, 
+                        norm=norm, norm_kwargs=norm_params, causal=self.causal, pad_mode=pad_mode, bias=bias)
+            )
+            self.downsample_layers.append(down)
+            
+            stg = nn.Sequential(
+                *[layer_type(dim=out_ch, drop_path=dp_rates[current_depth_idx + j]) for j in range(self.depths[i+1])]
+            )
+            self.stages.append(stg)
+            current_depth_idx += self.depths[i+1]
+            
+            current_channels = out_ch
+
+        if not disable_last_norm:
+            self.norm = norm_type(current_channels, eps=layernorm_eps)
+        else:
+            self.norm = nn.Identity()
+            
+        self.head = SConv1d(current_channels, self.dimension, kernel_size, stride=1, 
+                            norm=norm, norm_kwargs=norm_params, causal=self.causal, pad_mode=pad_mode, bias=bias)
+
+    def forward(self, x):
+        # x: [B, C, T]
+        
+        # Apply stem and stage 0
+        x = self.downsample_layers[0](x)
+        x = self.stages[0](x)
+        
+        # Apply downsamples and stages
+        for i in range(len(self.ratios)):
+            x = self.downsample_layers[i+1](x)
+            x = self.stages[i+1](x)
+            
+        x = self.norm(x)
+        x = self.head(x)
+        return x
     
     
 class VibeVoiceAcousticTokenizerModel(PreTrainedModel):
@@ -867,8 +985,27 @@ class VibeVoiceAcousticTokenizerModel(PreTrainedModel):
         
         self.decoder = TokenizerDecoder(decoder_config)
         
+        # Initialize Encoder
+        self.encoder = TokenizerEncoder(config)
+        
         # Initialize weights
         self.apply(self._init_weights)
+    
+    @torch.no_grad()
+    def encode(self, x):
+        """Encode audio to latents"""
+        # x: [B, 1, T] audio
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            
+        latents = self.encoder(x)
+        # Latents shape: [B, D, T']
+        # Typically we might want [B, T', D] depending on usage, but VibeVoice usually keeps [B, D, T] for internal processing
+        # until projection.
+        # But `acoustic_connector` expects [B, T, D] or [B, D, T]?
+        # SpeechConnector: nn.Linear(input_dim, ...) implies [..., input_dim].
+        # So we should permute to [B, T', D].
+        return latents.permute(0, 2, 1)
     
     def _init_weights(self, module):
         """Initialize weights for the model"""

@@ -140,6 +140,15 @@ def main():
         print("Note: device 'mpx' detected, treating it as 'mps'.")
         args.device = "mps"
 
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("Warning: CUDA not available. Checking for fallback...")
+        if torch.backends.mps.is_available():
+            print("Switching to MPS.")
+            args.device = "mps"
+        else:
+            print("Switching to CPU.")
+            args.device = "cpu"
+
     # Validate mps availability if requested
     if args.device == "mps" and not torch.backends.mps.is_available():
         print("Warning: MPS not available. Falling back to CPU.")

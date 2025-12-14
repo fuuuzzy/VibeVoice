@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import traceback
+import sys
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple, cast
@@ -58,7 +59,27 @@ class StreamingTTSService:
 
         if device == "mpx":
             print("Note: device 'mpx' detected, treating it as 'mps'.")
-            device = "mps"        
+            device = "mps"
+
+        if device == "cuda":
+            # Force fallback on macOS because CUDA is never available
+            if sys.platform == "darwin":
+                print("MacOS detected. CUDA is not supported. Checking for fallback...")
+                if torch.backends.mps.is_available():
+                    print("Switching to MPS.")
+                    device = "mps"
+                else:
+                    print("Switching to CPU.")
+                    device = "cpu"
+            elif not torch.cuda.is_available():
+                print("Warning: CUDA not available. Checking for fallback...")
+                if torch.backends.mps.is_available():
+                    print("Switching to MPS.")
+                    device = "mps"
+                else:
+                    print("Switching to CPU.")
+                    device = "cpu"
+
         if device == "mps" and not torch.backends.mps.is_available():
             print("Warning: MPS not available. Falling back to CPU.")
             device = "cpu"

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vibevoice"
 version = "0.0.1"
 authors = [
-  { name="vibevoice team", email="vibepod@microsoft.com" },
+    { name = "vibevoice team", email = "vibepod@microsoft.com" },
 ]
 description = "A model for speech generation with an AR + diffusion architecture."
 readme = "README.md"
@@ -36,6 +36,8 @@ dependencies = [
     "fastapi"
 ]
 
+[project.optional-dependencies]
+cuda = ["flash-attn>=2.0.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/microsoft/VibeVoice"
@@ -43,3 +45,19 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
