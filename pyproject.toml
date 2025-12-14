@@ -33,11 +33,9 @@ dependencies = [
     "av",
     "aiortc",
     "uvicorn[standard]",
-    "fastapi"
+    "fastapi",
+    "flash-attn>=2.0.0;sys_platform == 'linux'"
 ]
-
-[project.optional-dependencies]
-cuda = ["flash-attn>=2.0.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/microsoft/VibeVoice"
