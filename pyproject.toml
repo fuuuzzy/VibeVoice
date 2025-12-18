@@ -44,3 +44,6 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch", "packaging", "ninja"]
