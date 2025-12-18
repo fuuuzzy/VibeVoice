@@ -288,7 +288,12 @@ def main():
     # Choose dtype
     if device == "cuda":
         dtype = torch.bfloat16
-        attn = "flash_attention_2"
+        try:
+            import flash_attn
+            attn = "flash_attention_2"
+        except ImportError:
+            print("FlashAttention not installed, using SDPA")
+            attn = "sdpa"
     else:
         dtype = torch.float32
         attn = "sdpa"
