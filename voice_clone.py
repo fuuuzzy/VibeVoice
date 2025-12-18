@@ -52,9 +52,13 @@ def find_reference_audio(reference_dir, subtitle_id, audio_prefix='segment'):
     """Find reference audio file for a given subtitle ID"""
     patterns = [
         f"{audio_prefix}_{subtitle_id:03d}.wav", f"{audio_prefix}_{subtitle_id:03d}.mp3",
+        f"{audio_prefix}_{subtitle_id:03d}.mp4",
         f"{audio_prefix}_{subtitle_id}.wav", f"{audio_prefix}_{subtitle_id}.mp3",
+        f"{audio_prefix}_{subtitle_id}.mp4",
         f"{audio_prefix}{subtitle_id:03d}.wav", f"{audio_prefix}{subtitle_id:03d}.mp3",
+        f"{audio_prefix}{subtitle_id:03d}.mp4",
         f"{audio_prefix}{subtitle_id}.wav", f"{audio_prefix}{subtitle_id}.mp3",
+        f"{audio_prefix}{subtitle_id}.mp4",
     ]
     for pattern in patterns:
         path = os.path.join(reference_dir, pattern)
@@ -105,7 +109,7 @@ def prepare_voice_cache(model, processor, audio_path, device):
     # 1. Encode Audio to Latents
     if not voice_speech_inputs:
         raise ValueError(f"No speech inputs found in {audio_path}")
-        
+
     # voice_speech_inputs[0] is the numpy audio array
     wav_tensor = torch.tensor(voice_speech_inputs[0], device=device).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
 
@@ -141,7 +145,7 @@ def prepare_voice_cache(model, processor, audio_path, device):
         else:
             # If we explicitly need more tokens, we might need to pad embeddings or error out
             # For now, we assume the processor's calculation was an upper bound or close estimation
-             raise ValueError(f"Not enough speech embeddings generated: {num_speech_embeds} < {num_vae_tokens}")
+            raise ValueError(f"Not enough speech embeddings generated: {num_speech_embeds} < {num_vae_tokens}")
 
     # Inject
     inputs_embeds[is_vae_token] = speech_embeds.reshape(-1, speech_embeds.shape[-1])
@@ -230,7 +234,7 @@ def synthesize(text, prefilled_outputs, model, processor, output_path, device, c
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=None, # Will be set by model to max_pos_embeddings - current_len
+            max_new_tokens=None,  # Will be set by model to max_pos_embeddings - current_len
             cfg_scale=cfg_scale,
             tokenizer=processor.tokenizer,
             generation_config={'do_sample': False},
@@ -272,7 +276,8 @@ def main():
     # Check for HuggingFace cache structure (snapshots directory)
     if os.path.exists(args.model_path) and os.path.isdir(os.path.join(args.model_path, "snapshots")):
         snapshots_dir = os.path.join(args.model_path, "snapshots")
-        snapshots = [os.path.join(snapshots_dir, d) for d in os.listdir(snapshots_dir) if os.path.isdir(os.path.join(snapshots_dir, d))]
+        snapshots = [os.path.join(snapshots_dir, d) for d in os.listdir(snapshots_dir) if
+                     os.path.isdir(os.path.join(snapshots_dir, d))]
         if snapshots:
             # Sort by modification time to get the latest
             snapshots.sort(key=lambda x: os.path.getmtime(x), reverse=True)
