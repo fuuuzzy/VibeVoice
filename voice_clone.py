@@ -12,7 +12,8 @@ import argparse
 import copy
 import os
 import re
-
+import time
+import traceback
 import torch
 
 # Import VibeVoice modules
@@ -112,6 +113,9 @@ def prepare_voice_cache(model, processor, audio_path, device):
 
     # voice_speech_inputs[0] is the numpy audio array
     wav_tensor = torch.tensor(voice_speech_inputs[0], device=device).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+    
+    # Cast to model dtype (likely bfloat16) to avoid type mismatch errors
+    wav_tensor = wav_tensor.to(dtype=model.dtype)
 
     # Use the model's acoustic tokenizer (VAE/Encoder)
     if not hasattr(model.model, 'acoustic_tokenizer'):
@@ -230,23 +234,39 @@ def synthesize(text, prefilled_outputs, model, processor, output_path, device, c
         if torch.is_tensor(v):
             inputs[k] = v.to(device)
 
+    print(f"Starting generation for text: {text[:30]}...")
+    start_time = time.time()
+
     # Generate
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=None,  # Will be set by model to max_pos_embeddings - current_len
+            max_new_tokens=None,
             cfg_scale=cfg_scale,
             tokenizer=processor.tokenizer,
             generation_config={'do_sample': False},
             all_prefilled_outputs=copy.deepcopy(prefilled_outputs)
         )
-
+    
+    generation_time = time.time() - start_time
+    
     # Save Audio
-    if outputs.speech_outputs is not None and len(outputs.speech_outputs) > 0:
-        # Check if output is a list of tensors or a single tensor
+    if outputs.speech_outputs and len(outputs.speech_outputs) > 0:
         audio_data = outputs.speech_outputs[0]
-        # Ensure it's on CPU and numpy before saving if necessary, though save_audio handles tensors
         processor.save_audio(audio_data, output_path=output_path)
+        
+        # Calculate metrics
+        sample_rate = 24000
+        # Check shape to get duration
+        if torch.is_tensor(audio_data):
+            num_samples = audio_data.shape[-1]
+        else:
+            num_samples = audio_data.shape[-1] if hasattr(audio_data, 'shape') else len(audio_data)
+            
+        duration = num_samples / sample_rate
+        rtf = generation_time / duration if duration > 0 else 0
+        
+        print(f"Generated: {duration:.2f}s audio in {generation_time:.2f}s (RTF: {rtf:.2f}x)")
         return True
     return False
 
@@ -262,6 +282,7 @@ def main():
     parser.add_argument('--output', type=str, default="outputs_vibevoice", help="Output directory")
     parser.add_argument('--language', type=str, default="EN", help="Ignored (VibeVoice is multilingual)")
     parser.add_argument('--skip-existing', action='store_true')
+    parser.add_argument('--save-voice-cache', action='store_true', help="Save the generated voice cache to .pt file")
 
     args = parser.parse_args()
 
@@ -290,26 +311,63 @@ def main():
     processor = VibeVoiceStreamingProcessor.from_pretrained(args.model_path)
 
     # Load Model
-    # Choose dtype
-    if device == "cuda":
-        dtype = torch.bfloat16
-        try:
-            import flash_attn
-            attn = "flash_attention_2"
-        except ImportError:
-            print("FlashAttention not installed, using SDPA")
-            attn = "sdpa"
-    else:
-        dtype = torch.float32
-        attn = "sdpa"
+    # Decide dtype & attention implementation
+    if device == "mps":
+        load_dtype = torch.float32  # MPS requires float32
+        attn_impl_primary = "sdpa"  # flash_attention_2 not supported on MPS
+    elif device == "cuda":
+        load_dtype = torch.bfloat16
+        attn_impl_primary = "flash_attention_2"
+    else:  # cpu
+        load_dtype = torch.float32
+        attn_impl_primary = "sdpa"
+    
+    print(f"Using device: {device}, torch_dtype: {load_dtype}, attn_implementation: {attn_impl_primary}")
 
-    model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
-        args.model_path,
-        torch_dtype=dtype,
-        attn_implementation=attn
-    )
-    model.to(device)
+    # Load model with device-specific logic
+    try:
+        if device == "mps":
+            model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+                args.model_path,
+                torch_dtype=load_dtype,
+                attn_implementation=attn_impl_primary,
+                device_map=None,  # load then move
+            )
+            model.to("mps")
+        elif device == "cuda":
+            model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+                args.model_path,
+                torch_dtype=load_dtype,
+                device_map="cuda",
+                attn_implementation=attn_impl_primary,
+            )
+        else:  # cpu
+            model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+                args.model_path,
+                torch_dtype=load_dtype,
+                device_map="cpu",
+                attn_implementation=attn_impl_primary,
+            )
+    except Exception as e:
+        if attn_impl_primary == 'flash_attention_2':
+            print(f"[ERROR] : {type(e).__name__}: {e}")
+            print("Error loading the model. Trying to use SDPA. Note: SDPA may be slower/lower quality.")
+            model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
+                args.model_path,
+                torch_dtype=load_dtype,
+                device_map=(device if device in ("cuda", "cpu") else None),
+                attn_implementation='sdpa'
+            )
+            if device == "mps":
+                model.to("mps")
+        else:
+            raise e
+
     model.eval()
+    model.set_ddpm_inference_steps(num_steps=5)  # Crucial for reasonable inference time
+
+    if hasattr(model.model, 'language_model'):
+       print(f"Language model attention: {model.model.language_model.config._attn_implementation}")
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -320,6 +378,11 @@ def main():
         out_path = os.path.join(args.output, "output_single.wav")
         if synthesize(args.text, cache, model, processor, out_path, device):
             print(f"Saved: {out_path}")
+            
+            if args.save_voice_cache:
+                cache_path = os.path.splitext(out_path)[0] + "_cache.pt"
+                torch.save(cache, cache_path)
+                print(f"Saved voice cache to {cache_path}")
         else:
             print("Failed to generate audio")
 
