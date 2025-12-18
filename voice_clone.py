@@ -70,6 +70,7 @@ def prepare_voice_cache(model, processor, audio_path, device):
     This simulates the 'prefill' step for zero-shot cloning.
     """
     # Initialize a temporary VibeVoiceProcessor to handle prompt construction
+    # We copy configuration from the streaming processor to ensure consistency
     batch_processor = VibeVoiceProcessor(
         tokenizer=processor.tokenizer,
         audio_processor=processor.audio_processor,
@@ -79,8 +80,9 @@ def prepare_voice_cache(model, processor, audio_path, device):
 
     # Create voice prompt components
     # voice_tokens: tokens for " Voice input:\n Speaker 0: <start><vae tokens...><end>\n"
-    # voice_speech_inputs: list containing containing the audio array
-    voice_tokens, voice_speech_inputs, _ = batch_processor._create_voice_prompt([audio_path])
+    # voice_speech_inputs: list containing audio array
+    # voice_speech_masks: list of booleans (True for speech tokens)
+    voice_tokens, voice_speech_inputs, voice_speech_masks = batch_processor._create_voice_prompt([audio_path])
 
     # Create System Prompt
     system_prompt = batch_processor.system_prompt
@@ -101,16 +103,17 @@ def prepare_voice_cache(model, processor, audio_path, device):
     vae_token_id = processor.tokenizer.speech_diffusion_id
 
     # 1. Encode Audio to Latents
+    if not voice_speech_inputs:
+        raise ValueError(f"No speech inputs found in {audio_path}")
+        
     # voice_speech_inputs[0] is the numpy audio array
     wav_tensor = torch.tensor(voice_speech_inputs[0], device=device).unsqueeze(0).unsqueeze(0)  # (1, 1, T)
 
     # Use the model's acoustic tokenizer (VAE/Encoder)
-    # Note: We assume the acoustic tokenizer and connector are available on the model
     if not hasattr(model.model, 'acoustic_tokenizer'):
         raise RuntimeError("Model does not have acoustic_tokenizer")
 
     # Encode: output usually has .latents or directly tensor depending on model type
-    # Trying generic assumption for VibeVoice VAE
     encoded = model.model.acoustic_tokenizer.encode(wav_tensor)
     if hasattr(encoded, 'latents'):
         speech_latents = encoded.latents
@@ -132,22 +135,20 @@ def prepare_voice_cache(model, processor, audio_path, device):
 
     if num_vae_tokens != num_speech_embeds:
         # If mismatch, it might be due to padding or calculation diff in processor vs tokenizer
-        # We trim or pad speech embeds to match tokens
         print(f"Warning: Token count {num_vae_tokens} != Embed count {num_speech_embeds}. Adjusting.")
         if num_speech_embeds > num_vae_tokens:
             speech_embeds = speech_embeds[:, :num_vae_tokens, :]
         else:
-            # Pad is harder, but simplified approach:
-            pass
+            # If we explicitly need more tokens, we might need to pad embeddings or error out
+            # For now, we assume the processor's calculation was an upper bound or close estimation
+             raise ValueError(f"Not enough speech embeddings generated: {num_speech_embeds} < {num_vae_tokens}")
 
-            # Inject
+    # Inject
     inputs_embeds[is_vae_token] = speech_embeds.reshape(-1, speech_embeds.shape[-1])
 
     # --- Run Forward Pass to get Cache ---
 
     # 1. Forward LM (Text/Base LM)
-    # Note: forward_lm usually takes input_ids. But we want to pass inputs_embeds!
-    # The signature in modeling_vibevoice_streaming_inference.py accepts inputs_embeds.
     lm_outputs = model.forward_lm(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
@@ -156,57 +157,14 @@ def prepare_voice_cache(model, processor, audio_path, device):
     )
 
     # 2. Forward TTS LM
-    # TTS LM needs lm_last_hidden_state (from LM) and tts_text_masks.
-    # What is tts_text_masks for the prompt?
-    # In VibeVoiceProcessor, voice_speech_masks are True for speech tokens.
-    # In forward_tts_lm, we usually want 1 for text, 0 for speech?
-    # Or maybe it adds type embedding based on mask.
-    # modeling_vibevoice_streaming_inference.py:
-    # inputs_embeds = inputs_embeds + self.model.tts_input_types(tts_text_masks.long())
-    # So we need to provide the mask.
-    # Let's assume 0 = Speech, 1 = Text.
-    # The VibeVoiceProcessor returns `voice_speech_masks` where True=Speech (VAE tokens).
-
     # Construct speech mask for the full sequence
-    # System prompt is text (False/0 in processor mask terms?)
-    # Wait, in processor: speech_input_mask += [False] * len(system_tokens)
-    # So False means Text in processor? 
-    # Let's check VibeVoiceProcessor._create_voice_prompt:
-    #   voice_speech_masks = [False] * len(prefix) ... [True] * len(vae) ...
-    # So True means Speech.
-
-    # We need to map this to what the model expects.
-    # If model expects 0/1 types.
-    # Usually 0 is text, 1 is speech or vice versa.
-    # Let's check modeling code again?
-    # inputs_embeds + self.model.tts_input_types(tts_text_masks.long())
-    # If tts_text_masks is boolean, True -> 1, False -> 0.
-
-    # Let's assume we want keys "lm", "tts_lm".
-
-    # Reconstruct mask
-    # System tokens are text -> False
-    # Voice tokens: prefix(False), start(False?), vae(True), end(False?)
-    # We can follow what processor returns.
-
-    _, _, voice_speech_masks = batch_processor._create_voice_prompt([audio_path])
-
-    # Full mask
+    # System prompt is text (False/0? or just not covered by voice_speech_masks)
+    # The system tokens are definitively text. 
     full_speech_mask = [False] * len(system_tokens) + voice_speech_masks
     full_speech_mask_tensor = torch.tensor([full_speech_mask], device=device)  # True for speech
 
-    # TTS model usually interprets 1 as text, 0 as speech? Or types 0 and 1.
-    # If we pass boolean, it becomes 0 and 1.
-    # Type 0: Speech? Type 1: Text?
-    # Let's try to infer or assume 1=Text, 0=Speech (common).
-    # If speech_mask has True for Speech, then text_mask = ~speech_mask
+    # TTS model usually interprets 1 as text, 0 as speech
     tts_text_masks = (~full_speech_mask_tensor)
-
-    # We also need initial TTS embeddings. 
-    # forward_tts_lm takes inputs_embeds OR input_ids.
-    # It replaces the tail with lm_last_hidden_state.
-    # Since we are prefilling the PROMPT, the prompt drives the TTS LM too.
-    # We pass the same inputs_embeds (with injected audio).
 
     tts_lm_outputs = model.forward_tts_lm(
         inputs_embeds=inputs_embeds,
@@ -218,7 +176,7 @@ def prepare_voice_cache(model, processor, audio_path, device):
     )
 
     # 3. Negative Prompt Cache
-    # Usually empty or fixed negative prompt.
+    # <|image_pad|> is used as the negative prompt token
     neg_text_input_id = processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
     neg_input_ids = torch.tensor([[neg_text_input_id]], device=device)
     neg_attention_mask = torch.ones_like(neg_input_ids)
@@ -231,7 +189,6 @@ def prepare_voice_cache(model, processor, audio_path, device):
     )
 
     # Negative TTS LM
-    # Neg mask: is it text? <|image_pad|> is special. Treat as text (True).
     neg_text_masks = torch.ones((1, 1), device=device, dtype=torch.bool)
 
     neg_tts_lm_outputs = model.forward_tts_lm(
@@ -251,7 +208,7 @@ def prepare_voice_cache(model, processor, audio_path, device):
     }
 
 
-def synthesize(text, prefilled_outputs, model, processor, output_path, device):
+def synthesize(text, prefilled_outputs, model, processor, output_path, device, cfg_scale=1.5):
     """Synthesize speech using the prefilled voice cache"""
 
     # Prepare text input
@@ -273,8 +230,8 @@ def synthesize(text, prefilled_outputs, model, processor, output_path, device):
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=None,
-            cfg_scale=1.5,
+            max_new_tokens=None, # Will be set by model to max_pos_embeddings - current_len
+            cfg_scale=cfg_scale,
             tokenizer=processor.tokenizer,
             generation_config={'do_sample': False},
             all_prefilled_outputs=copy.deepcopy(prefilled_outputs)
@@ -282,7 +239,10 @@ def synthesize(text, prefilled_outputs, model, processor, output_path, device):
 
     # Save Audio
     if outputs.speech_outputs is not None and len(outputs.speech_outputs) > 0:
-        processor.save_audio(outputs.speech_outputs[0], output_path=output_path)
+        # Check if output is a list of tensors or a single tensor
+        audio_data = outputs.speech_outputs[0]
+        # Ensure it's on CPU and numpy before saving if necessary, though save_audio handles tensors
+        processor.save_audio(audio_data, output_path=output_path)
         return True
     return False
 
